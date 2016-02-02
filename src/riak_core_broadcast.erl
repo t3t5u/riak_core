@@ -298,8 +298,8 @@ handle_cast({ring_update, Ring}, State=#state{all_members=BroadcastMembers}) ->
                                        {stop, term(), #state{}}.
 handle_info(lazy_tick, State) ->
     schedule_lazy_tick(),
-    _ = send_lazy(State),
-    {noreply, State};
+    State1 = send_lazy(State),
+    {noreply, State1};
 handle_info(exchange_tick, State) ->
     schedule_exchange_tick(),
     State1 = maybe_exchange(State),
@@ -390,15 +390,26 @@ schedule_lazy_push(MessageId, Mod, Round, Root, From, State) ->
     Peers = lazy_peers(Root, From, State),
     add_all_outstanding(MessageId, Mod, Round, Root, Peers, State).
 
-send_lazy(#state{outstanding=Outstanding}) ->
-    [send_lazy(Peer, Messages) || {Peer, Messages} <- orddict:to_list(Outstanding)].
+send_lazy(State=#state{outstanding=Outstanding}) ->
+    lists:foldl(fun({Peer, Messages}, SAcc) -> send_lazy(Peer, Messages, SAcc) end,
+                State,
+                orddict:to_list(Outstanding)).
 
-send_lazy(Peer, Messages) ->
-    [send_lazy(MessageId, Mod, Round, Root, Peer) ||
-        {MessageId, Mod, Round, Root} <- ordsets:to_list(Messages)].
+send_lazy(Peer, Messages, State) ->
+    lists:foldl(fun({MessageId, Mod, Round, Root}, SAcc) -> send_lazy(MessageId, Mod, Round, Root, Peer, SAcc) end,
+                State,
+                ordsets:to_list(Messages)).
 
-send_lazy(MessageId, Mod, Round, Root, Peer) ->
-    send({i_have, MessageId, Mod, Round, Root, node()}, Peer).
+send_lazy(MessageId, Mod, Round, Root, Peer, State) ->
+    Result = Mod:graft(MessageId),
+    send_lazy(Result, MessageId, Mod, Round, Root, Peer, State).
+
+send_lazy({ok, _Message}, MessageId, Mod, Round, Root, Peer, State) ->
+    _ = send({i_have, MessageId, Mod, Round, Root, node()}, Peer),
+    State;
+send_lazy(Result, MessageId, Mod, Round, Root, Peer, State) ->
+    lager:debug("delete stale outstanding message. result: ~p, message_id: ~p, mod: ~p, round: ~p, root: ~p, peer: ~p", [Result, MessageId, Mod, Round, Root, Peer]),
+    ack_outstanding(MessageId, Mod, Round, Root, Peer, State).
 
 maybe_exchange(State) ->
     Root = random_root(State),
