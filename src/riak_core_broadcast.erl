@@ -296,6 +296,9 @@ handle_cast({ring_update, Ring}, State=#state{all_members=BroadcastMembers}) ->
 -spec handle_info(term(), #state{}) -> {noreply, #state{}} |
                                        {noreply, #state{}, non_neg_integer()} |
                                        {stop, term(), #state{}}.
+handle_info({lazy_graft, MessageId, Mod, Round, Root, From}, State) ->
+    State1 = case Mod:is_stale(MessageId) of false -> _ = send({graft, MessageId, Mod, Round, Root, node()}, From), add_eager(From, Root, State); _ -> State end,
+    {noreply, State1};
 handle_info(lazy_tick, State) ->
     schedule_lazy_tick(),
     State1 = send_lazy(State),
@@ -334,9 +337,9 @@ handle_ihave(true, MessageId, Mod, Round, Root, From, State) -> %% stale i_have
     _ = send({ignored_i_have, MessageId, Mod, Round, Root, node()}, From),
     State;
 handle_ihave(false, MessageId, Mod, Round, Root, From, State) -> %% valid i_have
-    %% TODO: don't graft immediately
-    _ = send({graft, MessageId, Mod, Round, Root, node()}, From),
-    add_eager(From, Root, State).
+    %% NOTE: don't graft immediately
+    _ = schedule_tick({lazy_graft, MessageId, Mod, Round, Root, From}, broadcast_eager_timeout, 1000),
+    State.
 
 handle_graft(stale, MessageId, Mod, Round, Root, From, State) ->
     %% There has been a subsequent broadcast that is causally newer than this message
