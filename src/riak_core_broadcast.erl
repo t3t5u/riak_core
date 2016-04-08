@@ -394,23 +394,25 @@ schedule_lazy_push(MessageId, Mod, Round, Root, From, State) ->
     add_all_outstanding(MessageId, Mod, Round, Root, Peers, State).
 
 send_lazy(State=#state{outstanding=Outstanding}) ->
-    lists:foldl(fun({Peer, Messages}, SAcc) -> send_lazy(Peer, Messages, SAcc) end,
+    OutstandingList = orddict:to_list(Outstanding),
+    LazyLimit = app_helper:get_env(riak_core, broadcast_send_lazy_limit, length(OutstandingList)),
+    RandomPeers = lists:sublist([Peer || {_, Peer} <- lists:ukeysort(1, [{random:uniform(), Peer} || {Peer, _} <- OutstandingList])], LazyLimit),
+    lists:foldl(fun({Peer, Messages}, SAcc) -> send_lazy(Peer, RandomPeers, Messages, SAcc) end,
                 State,
-                orddict:to_list(Outstanding)).
+                OutstandingList).
 
-send_lazy(Peer, Messages, State) ->
-    lists:foldl(fun({MessageId, Mod, Round, Root}, SAcc) -> send_lazy(MessageId, Mod, Round, Root, Peer, SAcc) end,
+send_lazy(Peer, RandomPeers, Messages, State) ->
+    lists:foldl(fun({MessageId, Mod, Round, Root}, SAcc) -> send_lazy(MessageId, Mod, Round, Root, Peer, RandomPeers, SAcc) end,
                 State,
                 ordsets:to_list(Messages)).
 
-send_lazy(MessageId, Mod, Round, Root, Peer, State) ->
+send_lazy(MessageId, Mod, Round, Root, Peer, RandomPeers, State) ->
     Result = Mod:graft(MessageId),
-    send_lazy(Result, MessageId, Mod, Round, Root, Peer, State).
+    send_lazy(Result, MessageId, Mod, Round, Root, Peer, RandomPeers, State).
 
-send_lazy({ok, _Message}, MessageId, Mod, Round, Root, Peer, State) ->
-    _ = send({i_have, MessageId, Mod, Round, Root, node()}, Peer),
-    State;
-send_lazy(Result, MessageId, Mod, Round, Root, Peer, State) ->
+send_lazy({ok, _Message}, MessageId, Mod, Round, Root, Peer, RandomPeers, State) ->
+    case lists:member(Peer, RandomPeers) of true -> _ = send({i_have, MessageId, Mod, Round, Root, node()}, Peer), State; _ -> State end;
+send_lazy(Result, MessageId, Mod, Round, Root, Peer, _RandomPeers, State) ->
     lager:debug("delete stale outstanding message. result: ~p, message_id: ~p, mod: ~p, round: ~p, root: ~p, peer: ~p", [Result, MessageId, Mod, Round, Root, Peer]),
     ack_outstanding(MessageId, Mod, Round, Root, Peer, State).
 
