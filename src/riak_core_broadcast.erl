@@ -265,12 +265,19 @@ handle_cast({broadcast, MessageId, Message, Mod, Round, Root, From}, State) ->
     Valid = Mod:merge(MessageId, Message),
     State1 = handle_broadcast(Valid, MessageId, Message, Mod, Round, Root, From, State),
     {noreply, State1};
+handle_cast({break, Root, From}, State) ->
+    State1 = remove_peers(From, Root, State),
+    {noreply, State1};
 handle_cast({prune, Root, From}, State) ->
-    State1 = add_lazy(From, Root, State),
+    AboveLimit = is_above_limit(Root, From, State),
+    State1 = if AboveLimit -> remove_peers(From, Root, State); true -> add_lazy(From, Root, State) end,
     {noreply, State1};
 handle_cast({i_have, MessageId, Mod, Round, Root, From}, State) ->
     Stale = Mod:is_stale(MessageId),
     State1 = handle_ihave(Stale, MessageId, Mod, Round, Root, From, State),
+    {noreply, State1};
+handle_cast({break, MessageId, Mod, Round, Root, From}, State) ->
+    State1 = ack_outstanding(MessageId, Mod, Round, Root, From, remove_peers(From, Root, State)),
     {noreply, State1};
 handle_cast({ignored_i_have, MessageId, Mod, Round, Root, From}, State) ->
     State1 = ack_outstanding(MessageId, Mod, Round, Root, From, State),
@@ -297,7 +304,10 @@ handle_cast({ring_update, Ring}, State=#state{all_members=BroadcastMembers}) ->
                                        {noreply, #state{}, non_neg_integer()} |
                                        {stop, term(), #state{}}.
 handle_info({lazy_graft, MessageId, Mod, Round, Root, From}, State) ->
-    State1 = case Mod:is_stale(MessageId) of false -> _ = send({graft, MessageId, Mod, Round, Root, node()}, From), add_eager(From, Root, State); _ -> State end,
+    Stale = Mod:is_stale(MessageId),
+    AboveLimit = is_above_limit(Root, From, State),
+    _ = send({if Stale, AboveLimit -> break; Stale -> ignored_i_have; true -> graft end, MessageId, Mod, Round, Root, node()}, From),
+    State1 = if Stale, AboveLimit -> remove_peers(From, Root, State); true -> State end,
     {noreply, State1};
 handle_info(lazy_tick, State) ->
     schedule_lazy_tick(),
@@ -325,8 +335,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 handle_broadcast(false, _MessageId, _Message, _Mod, _Round, Root, From, State) -> %% stale msg
-    State1 = add_lazy(From, Root, State),
-    _ = send({prune, Root, node()}, From),
+    AboveLimit = is_above_limit(Root, From, State),
+    State1 = if AboveLimit -> remove_peers(From, Root, State); true -> add_lazy(From, Root, State) end,
+    _ = send({if AboveLimit -> break; true -> prune end, Root, node()}, From),
     State1;
 handle_broadcast(true, MessageId, Message, Mod, Round, Root, From, State) -> %% valid msg
     State1 = add_eager(From, Root, State),
@@ -334,8 +345,9 @@ handle_broadcast(true, MessageId, Message, Mod, Round, Root, From, State) -> %% 
     schedule_lazy_push(MessageId, Mod, Round+1, Root, From, State2).
 
 handle_ihave(true, MessageId, Mod, Round, Root, From, State) -> %% stale i_have
-    _ = send({ignored_i_have, MessageId, Mod, Round, Root, node()}, From),
-    State;
+    AboveLimit = is_above_limit(Root, From, State),
+    _ = send({if AboveLimit -> break; true -> ignored_i_have end, MessageId, Mod, Round, Root, node()}, From),
+    if AboveLimit -> remove_peers(From, Root, State); true -> State end;
 handle_ihave(false, MessageId, Mod, Round, Root, From, State) -> %% valid i_have
     %% NOTE: don't graft immediately
     _ = schedule_tick({lazy_graft, MessageId, Mod, Round, Root, From}, broadcast_eager_timeout, 1000),
@@ -382,7 +394,7 @@ eager_push(MessageId, Message, Mod, State) ->
     eager_push(MessageId, Message, Mod, 0, node(), node(), State).
 
 eager_push(MessageId, Message, Mod, Round, Root, From, State) ->
-    Peers = eager_peers(Root, From, State),
+    Peers = eager_peers(Root, From, maybe_add_random_eager(From, Root, State)),
     _ = send({broadcast, MessageId, Message, Mod, Round, Root, node()}, Peers),
     State.
 
@@ -541,11 +553,17 @@ existing_outstanding(Peer, All) ->
         {ok, Outstanding} -> Outstanding
     end.
 
+maybe_add_random_eager(From, Root, State) ->
+    case is_below_limit(Root, From, State) of true -> add_eager(random_peer(Root, State), Root, State); _ -> State end.
+
 add_eager(From, Root, State) ->
     update_peers(From, Root, fun ordsets:add_element/2, fun ordsets:del_element/2, State).
 
 add_lazy(From, Root, State) ->
     update_peers(From, Root, fun ordsets:del_element/2, fun ordsets:add_element/2, State).
+
+remove_peers(From, Root, State) ->
+    update_peers(From, Root, fun ordsets:del_element/2, fun ordsets:del_element/2, State).
 
 update_peers(From, Root, EagerUpdate, LazyUpdate, State) ->
     CurrentEagers = all_eager_peers(Root, State),
@@ -558,6 +576,18 @@ set_peers(Root, Eagers, Lazys, State=#state{eager_sets=EagerSets,lazy_sets=LazyS
     NewEagers = orddict:store(Root, Eagers, EagerSets),
     NewLazys = orddict:store(Root, Lazys, LazySets),
     State#state{eager_sets=NewEagers, lazy_sets=NewLazys}.
+
+is_above_limit(Root, From, State) ->
+    (number_of_current_peers(Root, From, State) + 1) > app_helper:get_env(riak_core, broadcast_maximal_peers, (number_of_default_peers(State) * 2)).
+
+is_below_limit(Root, From, State) ->
+    number_of_current_peers(Root, From, State) < app_helper:get_env(riak_core, broadcast_minimal_peers, number_of_default_peers(State)).
+
+number_of_current_peers(Root, From, State) ->
+    length(ordsets:union([eager_peers(Root, From, State), lazy_peers(Root, From, State)])).
+
+number_of_default_peers(State) ->
+    length(ordsets:union([State#state.common_eagers, State#state.common_lazys])).
 
 all_eager_peers(Root, State) ->
     all_peers(Root, State#state.eager_sets, State#state.common_eagers).
