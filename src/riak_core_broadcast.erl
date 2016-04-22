@@ -258,9 +258,14 @@ handle_call({cancel_exchanges, WhichExchanges}, _From, State) ->
                                        {noreply, #state{}, non_neg_integer()} |
                                        {stop, term(), #state{}}.
 handle_cast({broadcast, MessageId, Message, Mod}, State) ->
-    State1 = eager_push(MessageId, Message, Mod, State),
+    Direct = app_helper:get_env(riak_core, broadcast_direct, false),
+    State1 = eager_push(MessageId, Message, Mod, if Direct -> direct_push(MessageId, Message, Mod, State); true -> State end),
     State2 = schedule_lazy_push(MessageId, Mod, State1),
     {noreply, State2};
+handle_cast({broadcast, MessageId, Message, Mod, Root, From}, State) ->
+    Valid = Mod:merge(MessageId, Message),
+    State1 = if Valid -> schedule_lazy_push(MessageId, Mod, 1, Root, From, State); true -> State end,
+    {noreply, State1};
 handle_cast({broadcast, MessageId, Message, Mod, Round, Root, From}, State) ->
     Valid = Mod:merge(MessageId, Message) andalso Round =< app_helper:get_env(riak_core, broadcast_maximum_round, 10),
     State1 = handle_broadcast(Valid, MessageId, Message, Mod, Round, Root, From, State),
@@ -389,6 +394,11 @@ neighbors_down(Removed, State=#state{common_eagers=CommonEagers,eager_sets=Eager
                 eager_sets=NewEagerSets,
                 lazy_sets=NewLazySets,
                 outstanding=NewOutstanding}.
+
+direct_push(MessageId, Message, Mod, State=#state{all_members=AllMembers}) ->
+    Peers = ordsets:subtract(ordsets:del_element(node(), AllMembers), eager_peers(node(), node(), State)),
+    _ = send({broadcast, MessageId, Message, Mod, node(), node()}, Peers),
+    State.
 
 eager_push(MessageId, Message, Mod, State) ->
     eager_push(MessageId, Message, Mod, 0, node(), node(), State).
@@ -587,7 +597,8 @@ number_of_current_peers(Root, From, State) ->
     length(ordsets:union([eager_peers(Root, From, State), lazy_peers(Root, From, State)])).
 
 number_of_default_peers(State) ->
-    length(ordsets:union([State#state.common_eagers, State#state.common_lazys])).
+    Direct = app_helper:get_env(riak_core, broadcast_direct, false),
+    if Direct -> (length(State#state.common_eagers) div 2); true -> length(ordsets:union([State#state.common_eagers, State#state.common_lazys])) end.
 
 all_eager_peers(Root, State) ->
     all_peers(Root, State#state.eager_sets, State#state.common_eagers).
