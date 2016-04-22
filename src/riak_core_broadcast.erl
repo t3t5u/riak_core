@@ -262,7 +262,7 @@ handle_cast({broadcast, MessageId, Message, Mod}, State) ->
     State2 = schedule_lazy_push(MessageId, Mod, State1),
     {noreply, State2};
 handle_cast({broadcast, MessageId, Message, Mod, Round, Root, From}, State) ->
-    Valid = Mod:merge(MessageId, Message),
+    Valid = Mod:merge(MessageId, Message) andalso Round =< app_helper:get_env(riak_core, broadcast_maximum_round, 10),
     State1 = handle_broadcast(Valid, MessageId, Message, Mod, Round, Root, From, State),
     {noreply, State1};
 handle_cast({break, Root, From}, State) ->
