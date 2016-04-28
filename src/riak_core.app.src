@@ -13,12 +13,14 @@
                   lager,
                   sasl,
                   crypto,
+                  cuttlefish, % Using at riak_sysmon
                   riak_sysmon,
                   os_mon,
                   basho_stats,
                   eleveldb,
                   pbkdf2,
                   poolboy,
+                  setup, % Using at exometer_core
                   exometer_core,
                   clique
                  ]},
